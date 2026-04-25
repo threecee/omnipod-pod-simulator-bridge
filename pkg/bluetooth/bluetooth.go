@@ -4,34 +4,21 @@
 package bluetooth
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"hash/crc32"
 	"sync"
-	"time"
 
-	"github.com/avereha/pod/pkg/message"
-	"github.com/davecgh/go-spew/spew"
 	"github.com/paypal/gatt"
 	"github.com/paypal/gatt/linux/cmd"
 	log "github.com/sirupsen/logrus"
 )
 
 type Ble struct {
-	dataInput  chan Packet
-	cmdInput   chan Packet
-	dataOutput chan Packet
-	cmdOutput  chan Packet
+	*BleCore
 
-	messageInput  chan *message.Message
-	messageOutput chan *message.Message
-
-	stopLoop chan bool
-	device   *gatt.Device
-	central  *gatt.Central
+	device  *gatt.Device
+	central *gatt.Central
 
 	cmdNotifier    gatt.Notifier
 	cmdNotifierMtx sync.Mutex
@@ -57,13 +44,8 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 	}
 
 	b := &Ble{
-		dataInput:     make(chan Packet, 5),
-		cmdInput:      make(chan Packet, 5),
-		dataOutput:    make(chan Packet, 5),
-		cmdOutput:     make(chan Packet, 5),
-		messageInput:  make(chan *message.Message, 5),
-		messageOutput: make(chan *message.Message, 2),
-		device:        &d,
+		BleCore: NewBleCore(),
+		device:  &d,
 	}
 
 	d.Handle(
@@ -77,10 +59,11 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 		}),
 	)
 
-	// Start cmd writing goroutine
+	// Start cmd writing goroutine — drains BleCore.cmdOutput and pushes
+	// notifications out through the GATT cmd characteristic notifier.
 	go func() {
 		for {
-			packet := <-b.cmdOutput
+			packet := b.PullCmd()
 			b.cmdNotifierMtx.Lock()
 			if b.cmdNotifier.Done() {
 				log.Fatalf("pkg bluetooth; CMD closed")
@@ -97,7 +80,7 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 	// Start data writing goroutine
 	go func() {
 		for {
-			packet := <-b.dataOutput
+			packet := b.PullData()
 			b.dataNotifierMtx.Lock()
 			if b.dataNotifier.Done() {
 				log.Fatalf("pkg bluetooth; DATA closed")
@@ -128,7 +111,7 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 					log.Tracef("received CMD,  %x", data)
 					ret := make([]byte, len(data))
 					copy(ret, data)
-					b.cmdInput <- Packet(ret)
+					b.PushCmd(Packet(ret))
 					return 0
 				})
 
@@ -155,7 +138,7 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 					log.Tracef("pkg bluetooth; received DATA,%x, -- %d", data, len(data))
 					ret := make([]byte, len(data))
 					copy(ret, data)
-					b.dataInput <- Packet(ret)
+					b.PushData(Packet(ret))
 					return 0
 				})
 
@@ -205,8 +188,8 @@ func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, f
 	// Looking at the paypal/gatt source code, we don't need to call StopAdvertising,
 	// but just call AdvertiseNameAndServices and it should update
 
-	log.Tracef("podIdServiceOne", gatt.UUID16(binary.BigEndian.Uint16(id[0:2])))
-	log.Tracef("podIdServiceTwo", gatt.UUID16(binary.BigEndian.Uint16(id[2:4])))
+	log.Tracef("podIdServiceOne %v", gatt.UUID16(binary.BigEndian.Uint16(id[0:2])))
+	log.Tracef("podIdServiceTwo %v", gatt.UUID16(binary.BigEndian.Uint16(id[2:4])))
 	err := (*b.device).AdvertiseNameAndServices(" :: Fake POD ::", []gatt.UUID{
 		gatt.UUID16(0x4024),
 
@@ -228,247 +211,6 @@ func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, f
 	return err
 }
 
-func (b *Ble) WriteCmd(packet Packet) error {
-
-	b.cmdOutput <- packet
-	return nil
-}
-
-func (b *Ble) WriteData(packet Packet) error {
-	b.dataOutput <- packet
-	return nil
-}
-
-func (b *Ble) writeDataBuffer(buf *bytes.Buffer) error {
-	data := make([]byte, buf.Len())
-	copy(data, buf.Bytes())
-	buf.Reset()
-	return b.WriteData(data)
-}
-
-func (b *Ble) ReadCmd() (Packet, error) {
-	packet := <-b.cmdInput
-	return packet, nil
-}
-
-func (b *Ble) ReadData() (Packet, error) {
-	packet := <-b.dataInput
-	return packet, nil
-}
-
-func (b *Ble) ReadMessage() (*message.Message, error) {
-	message := <-b.messageInput
-	return message, nil
-}
-
-func (b *Ble) ReadMessageWithTimeout(d time.Duration) (*message.Message, bool) {
-	select {
-	case message := <-b.messageInput:
-		return message, false
-	case <-time.After(d):
-		log.Debugf("ReadMessage timeout")
-		return nil, true
-	}
-}
-
 func (b *Ble) ShutdownConnection() {
 	(*b.central).Close()
-}
-
-func (b *Ble) WriteMessage(message *message.Message) {
-	b.messageOutput <- message
-}
-
-func (b *Ble) loop(stop chan bool) {
-	for {
-		select {
-		case <-stop:
-			return
-		case msg := <-b.messageOutput:
-			b.writeMessage(msg)
-		case cmd := <-b.cmdInput:
-			msg, err := b.readMessage(cmd)
-			if err != nil {
-				log.Fatalf("pkg bluetooth; error reading message: %s", err)
-			}
-			b.messageInput <- msg
-		}
-	}
-}
-
-func (b *Ble) StartMessageLoop() {
-	if b.stopLoop != nil {
-		log.Fatalf("pkg bluetooth; Messaging loop is already running")
-	}
-	b.stopLoop = make(chan bool)
-	go b.loop(b.stopLoop)
-}
-
-func (b *Ble) StopMessageLoop() {
-	// race condition, but this is called only on device disconnect
-	if b.stopLoop != nil {
-		close(b.stopLoop)
-		b.stopLoop = nil
-	}
-}
-
-func (b *Ble) expectCommand(expected Packet) {
-	cmd, _ := b.ReadCmd()
-	if !bytes.Equal(expected[:1], cmd[:1]) {
-		log.Fatalf("pkg bluetooth; expected command: %s. received command: %s", expected, cmd)
-	}
-}
-
-func (b *Ble) writeMessage(msg *message.Message) {
-	var buf bytes.Buffer
-	var index byte = 0
-
-	b.WriteCmd(CmdRTS)
-	b.expectCommand(CmdCTS) // TODO figure out what to do if !CTS
-	bytes, err := msg.Marshal()
-	if err != nil {
-		log.Fatalf("pkg bluetooth; could not marshal the message %s", err)
-	}
-	log.Tracef("pkg bluetooth; Sending message: %x", bytes)
-	sum := crc32.ChecksumIEEE(bytes)
-	if len(bytes) <= 18 {
-		buf.WriteByte(index) // index
-		buf.WriteByte(0)     // fragments
-
-		buf.WriteByte(byte(sum >> 24))
-		buf.WriteByte(byte(sum >> 16))
-		buf.WriteByte(byte(sum >> 8))
-		buf.WriteByte(byte(sum))
-		buf.WriteByte((byte(len(bytes))))
-		end := len(bytes)
-		if len(bytes) > 14 {
-			end = 14
-		}
-		buf.Write(bytes[:end])
-		b.writeDataBuffer(&buf)
-
-		if len(bytes) > 14 {
-			buf.WriteByte(index)
-			buf.WriteByte(byte(len(bytes) - 14))
-			buf.Write(bytes[14:])
-			b.writeDataBuffer(&buf)
-		}
-		return
-	}
-
-	size := len(bytes)
-	fullFragments := (byte)((size - 18) / 19)
-	rest := (byte)((size - (int(fullFragments) * 19)) - 18)
-	buf.WriteByte(index)
-	buf.WriteByte(fullFragments + 1)
-	buf.Write(bytes[:18])
-
-	b.writeDataBuffer(&buf)
-
-	for index = 1; index <= fullFragments; index++ {
-		buf.WriteByte(index)
-		if index == 1 {
-			buf.Write(bytes[18:37])
-		} else {
-			buf.Write(bytes[(index-1)*19+18 : (index-1)*19+18+19])
-		}
-		b.writeDataBuffer(&buf)
-	}
-
-	buf.WriteByte(index)
-	buf.WriteByte(rest)
-	buf.WriteByte(byte(sum >> 24))
-	buf.WriteByte(byte(sum >> 16))
-	buf.WriteByte(byte(sum >> 8))
-	buf.WriteByte(byte(sum))
-	end := rest
-	if rest > 14 {
-		end = 14
-	}
-	buf.Write(bytes[(fullFragments*19)+18 : (fullFragments*19)+18+end])
-	b.writeDataBuffer(&buf)
-	if rest > 14 {
-		index++
-		buf.WriteByte(index)
-		buf.WriteByte(rest - 14)
-		buf.Write(bytes[fullFragments*19+18+14:])
-		for buf.Len() < 20 {
-			buf.WriteByte(0)
-		}
-		b.writeDataBuffer(&buf)
-	}
-	b.expectCommand(CmdSuccess)
-}
-
-func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
-	var buf bytes.Buffer
-	var checksum []byte
-
-	log.Trace("pkg bluetooth; Reading RTS")
-	if !bytes.Equal(CmdRTS[:1], cmd[:1]) {
-		log.Fatalf("pkg bluetooth; expected command: %x. received command: %x", CmdRTS, cmd)
-	}
-	log.Trace("pkg bluetooth; Sending CTS")
-
-	b.WriteCmd(CmdCTS)
-
-	first, _ := b.ReadData()
-	fragments := int(first[1])
-	expectedIndex := 1
-	oneExtra := false
-	if fragments == 0 {
-		checksum = first[2:6]
-		len := first[6]
-		end := len + 7
-		if len > 13 {
-			oneExtra = true
-			end = 20
-		}
-		buf.Write(first[7:end])
-	} else {
-		buf.Write(first[2:20])
-	}
-	for i := 1; i < fragments; i++ {
-		data, _ := b.ReadData()
-		if i == expectedIndex {
-			buf.Write(data[1:20])
-		} else {
-			log.Warnf("pkg bluetooth; sending NACK, packet index is wrong")
-			buf.Write(data[:])
-			CmdNACK[1] = byte(expectedIndex)
-			b.WriteCmd(CmdNACK)
-		}
-		expectedIndex++
-	}
-	if fragments != 0 {
-		data, _ := b.ReadData()
-		len := data[1]
-		if len > 14 {
-			oneExtra = true
-			len = 14
-		}
-		checksum = data[2:6]
-		buf.Write(data[6 : len+6])
-	}
-	log.Tracef("pkg bluetooth; One extra: %t", oneExtra)
-	if oneExtra {
-		data, _ := b.ReadData()
-		buf.Write(data[2 : data[1]+2])
-	}
-	bytes := buf.Bytes()
-	sum := crc32.ChecksumIEEE(bytes)
-	if binary.BigEndian.Uint32(checksum) != sum {
-		log.Warnf("pkg bluetooth; checksum missmatch. checksum is: %x. want: %x", sum, checksum)
-		log.Warnf("pkg bluetooth; data: %s", hex.EncodeToString(bytes))
-
-		b.WriteCmd(CmdFail)
-		return nil, errors.New("checksum missmatch")
-	}
-
-	b.WriteCmd(CmdSuccess)
-
-	msg, _err := message.Unmarshal(bytes)
-	log.Tracef("pkg bluetooth; Received message:", spew.Sdump(msg))
-
-	return msg, _err
 }
