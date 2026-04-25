@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package bluetooth
 
 import (
@@ -15,17 +18,6 @@ import (
 	"github.com/paypal/gatt"
 	"github.com/paypal/gatt/linux/cmd"
 	log "github.com/sirupsen/logrus"
-)
-
-type Packet []byte
-
-var (
-	CmdRTS     = Packet([]byte{0})
-	CmdCTS     = Packet([]byte{1})
-	CmdNACK    = Packet([]byte{2, 0})
-	CmdAbort   = Packet([]byte{3})
-	CmdSuccess = Packet([]byte{4})
-	CmdFail    = Packet([]byte{5})
 )
 
 type Ble struct {
@@ -262,10 +254,6 @@ func (b *Ble) ReadCmd() (Packet, error) {
 func (b *Ble) ReadData() (Packet, error) {
 	packet := <-b.dataInput
 	return packet, nil
-}
-
-func (p Packet) String() string {
-	return hex.EncodeToString(p)
 }
 
 func (b *Ble) ReadMessage() (*message.Message, error) {
