@@ -19,4 +19,8 @@ type BleInterface interface {
 	WriteMessage(*message.Message)
 	ShutdownConnection()
 	RefreshAdvertisingWithSpecifiedId([]byte) error
+	// Interrupt closes any in-flight ReadMessageWithTimeout so the pod
+	// state machine's CommandLoop can bail out promptly on BLE disconnect
+	// instead of waiting for the 60-second idle timeout. T.1 Phase 8.
+	Interrupt()
 }

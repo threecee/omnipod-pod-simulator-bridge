@@ -45,10 +45,20 @@ func (a *podAdapter) OnConnect() error {
 }
 
 func (a *podAdapter) OnDisconnect() error {
-	// We don't tear down the pod state machine here — it's stateful and
-	// the central may reconnect. The production *Ble had similar
-	// semantics (StopMessageLoop was commented out on connect in the
-	// original code).
+	// Signal any in-flight ReadMessageWithTimeout in the pod state
+	// machine's CommandLoop to bail out immediately. The CommandLoop sees
+	// `didTimeout=true` and falls into its existing reset path:
+	// ShutdownConnection() then `go StartAcceptingCommands()`. The next
+	// OnConnect for the same paired pod will then re-enter EAP-AKA via
+	// the `if p.state.LTK != nil` branch in StartAcceptingCommands —
+	// which is exactly the post-disconnect re-handshake the watch needs
+	// when it takes over the pod after a B.2.e handoff.
+	//
+	// We intentionally do NOT call StopMessageLoop() here — the
+	// CommandLoop is responsible for that itself once it sees the
+	// timeout, mirroring the production idle-timeout flow exactly.
+	// T.1 Phase 8.
+	a.bridgeBle.Interrupt()
 	return nil
 }
 

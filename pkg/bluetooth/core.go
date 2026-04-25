@@ -37,6 +37,19 @@ type BleCore struct {
 
 	stopLoop chan bool
 	stopMtx  sync.Mutex
+
+	// interrupt is closed by the transport (e.g., bridge.OnDisconnect) to
+	// signal that any blocking ReadMessageWithTimeout should return as if it
+	// had timed out. This lets the pod state machine's CommandLoop bail out
+	// and re-enter StartAcceptingCommands when the BLE peer disconnects,
+	// rather than waiting for the 60-second idle timeout. T.1 Phase 8: needed
+	// to support phone↔watch handoff with paired-LTK re-handshake against
+	// the same pod-sim subprocess.
+	//
+	// A new channel is allocated on every ResetInterrupt (called by
+	// StartMessageLoop). Guarded by interruptMtx.
+	interrupt    chan struct{}
+	interruptMtx sync.Mutex
 }
 
 // NewBleCore returns a freshly-buffered BleCore with channels matching the
@@ -49,6 +62,25 @@ func NewBleCore() *BleCore {
 		dataOutput:    make(chan Packet, 5),
 		messageInput:  make(chan *message.Message, 5),
 		messageOutput: make(chan *message.Message, 2),
+		interrupt:     make(chan struct{}),
+	}
+}
+
+// Interrupt closes the interrupt channel. Any in-flight
+// ReadMessageWithTimeout call will return immediately as (nil, true) — i.e.,
+// the same shape as a real timeout. The pod state machine treats that as a
+// signal to call ShutdownConnection and re-enter StartAcceptingCommands.
+//
+// Idempotent (safe to call multiple times for the same disconnect event).
+// The channel is re-allocated on the next StartMessageLoop call.
+func (b *BleCore) Interrupt() {
+	b.interruptMtx.Lock()
+	defer b.interruptMtx.Unlock()
+	select {
+	case <-b.interrupt:
+		// already closed; idempotent
+	default:
+		close(b.interrupt)
 	}
 }
 
@@ -118,11 +150,17 @@ func (b *BleCore) ReadMessage() (*message.Message, error) {
 }
 
 func (b *BleCore) ReadMessageWithTimeout(d time.Duration) (*message.Message, bool) {
+	b.interruptMtx.Lock()
+	interrupt := b.interrupt
+	b.interruptMtx.Unlock()
 	select {
 	case m := <-b.messageInput:
 		return m, false
 	case <-time.After(d):
 		log.Debugf("ReadMessage timeout")
+		return nil, true
+	case <-interrupt:
+		log.Debugf("ReadMessage interrupted (BLE disconnect)")
 		return nil, true
 	}
 }
@@ -155,6 +193,11 @@ func (b *BleCore) StartMessageLoop() {
 		log.Fatalf("pkg bluetooth; Messaging loop is already running")
 	}
 	b.stopLoop = make(chan bool)
+	// Reset the interrupt channel so the new message-loop session has a
+	// fresh signal slot. T.1 Phase 8.
+	b.interruptMtx.Lock()
+	b.interrupt = make(chan struct{})
+	b.interruptMtx.Unlock()
 	go b.loop(b.stopLoop)
 }
 
