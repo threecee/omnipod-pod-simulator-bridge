@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
 	"github.com/avereha/pod/pkg/pair"
@@ -29,7 +28,7 @@ type PodMsgBody struct {
 }
 
 type Pod struct {
-	ble            *bluetooth.Ble
+	ble            BleInterface
 	state          *PODState
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
@@ -39,7 +38,7 @@ type Pod struct {
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
 
-func New(ble *bluetooth.Ble, stateFile string, freshState bool) *Pod {
+func New(ble BleInterface, stateFile string, freshState bool) *Pod {
 	var err error
 
 	state := &PODState{
@@ -277,9 +276,9 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		if cmd.GetType() == command.SET_UNIQUE_ID {
 			// Set the unique ID
-			log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %@", cmd.GetPayload())
+			log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %x", cmd.GetPayload())
 			uniqueId := cmd.GetPayload()
-			log.Tracef("SET_UNIQUE_ID uniqueId %@", uniqueId)
+			log.Tracef("SET_UNIQUE_ID uniqueId %x", uniqueId)
 			p.ble.RefreshAdvertisingWithSpecifiedId(uniqueId)
 			p.state.Id = uniqueId
 		}
