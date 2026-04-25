@@ -4,10 +4,12 @@
 package bridge
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 type MsgType byte
@@ -54,6 +56,47 @@ func WriteFrame(w io.Writer, t MsgType, payload []byte) error {
 		}
 	}
 	return nil
+}
+
+// FrameWriter is a frame-atomic, goroutine-safe wrapper around an io.Writer.
+//
+// The dispatch loop and the BridgeBle drain goroutines all emit frames to
+// stdout concurrently. WriteFrame's two-call pattern (header then payload)
+// is NOT atomic against a bare mutex on the underlying io.Writer — a writer
+// could grab the mutex *between* another writer's header and payload, which
+// would desync the stream on the central side.
+//
+// FrameWriter.WriteFrame builds the full frame in a buffer first, then
+// performs ONE Write under the mutex, guaranteeing each frame appears as a
+// contiguous run of bytes on the wire. All concurrent producers MUST go
+// through *FrameWriter — no caller should write to the underlying io.Writer
+// directly.
+type FrameWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+// NewFrameWriter wraps w. Concurrent callers of WriteFrame are safe; the
+// underlying w is touched only under the FrameWriter's mutex.
+func NewFrameWriter(w io.Writer) *FrameWriter {
+	return &FrameWriter{w: w}
+}
+
+// WriteFrame builds the [type:1][length:4 BE][payload] frame in a buffer
+// and writes it atomically to the underlying io.Writer.
+func (fw *FrameWriter) WriteFrame(t MsgType, payload []byte) error {
+	if len(payload) > MaxPayloadSize {
+		return fmt.Errorf("payload too large: %d > %d", len(payload), MaxPayloadSize)
+	}
+	var buf bytes.Buffer
+	buf.Grow(5 + len(payload))
+	if err := WriteFrame(&buf, t, payload); err != nil {
+		return err
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	_, err := fw.w.Write(buf.Bytes())
+	return err
 }
 
 func ReadFrame(r io.Reader) (MsgType, []byte, error) {

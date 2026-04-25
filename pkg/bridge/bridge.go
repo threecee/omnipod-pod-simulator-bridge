@@ -20,7 +20,13 @@ func New(p Pod) *Bridge {
 	return &Bridge{pod: p}
 }
 
-func (b *Bridge) Run(in io.Reader, out io.Writer, logSink io.Writer) error {
+// Run reads frames from `in` and dispatches them. All outbound frames go
+// through `out` (a *FrameWriter), which serializes writes so the dispatch
+// loop and any concurrent producers (e.g. the BridgeBle drain goroutines
+// in main.go) cannot interleave header/payload bytes on the wire.
+//
+// `logSink` is currently unused but reserved for future debug-frame logging.
+func (b *Bridge) Run(in io.Reader, out *FrameWriter, logSink io.Writer) error {
 	for {
 		msgType, payload, err := ReadFrame(in)
 		if errors.Is(err, io.EOF) {
@@ -31,23 +37,23 @@ func (b *Bridge) Run(in io.Reader, out io.Writer, logSink io.Writer) error {
 		}
 		if err := b.dispatch(msgType, payload, out, logSink); err != nil {
 			errPayload := []byte(err.Error())
-			_ = WriteFrame(out, MsgError, errPayload)
+			_ = out.WriteFrame(MsgError, errPayload)
 		}
 	}
 }
 
-func (b *Bridge) dispatch(t MsgType, payload []byte, out io.Writer, logSink io.Writer) error {
+func (b *Bridge) dispatch(t MsgType, payload []byte, out *FrameWriter, logSink io.Writer) error {
 	switch t {
 	case MsgConnect:
 		if err := b.pod.OnConnect(); err != nil {
 			return fmt.Errorf("OnConnect: %w", err)
 		}
-		return WriteFrame(out, MsgConnectAck, nil)
+		return out.WriteFrame(MsgConnectAck, nil)
 	case MsgDisconnect:
 		if err := b.pod.OnDisconnect(); err != nil {
 			return fmt.Errorf("OnDisconnect: %w", err)
 		}
-		return WriteFrame(out, MsgDisconnectAck, nil)
+		return out.WriteFrame(MsgDisconnectAck, nil)
 	case MsgSubscribe, MsgUnsubscribe:
 		return nil
 	case MsgWrite:
@@ -65,7 +71,7 @@ func (b *Bridge) dispatch(t MsgType, payload []byte, out io.Writer, logSink io.W
 			notifyPayload := make([]byte, 16+len(notify))
 			copy(notifyPayload[:16], charUUID[:])
 			copy(notifyPayload[16:], notify)
-			return WriteFrame(out, MsgNotify, notifyPayload)
+			return out.WriteFrame(MsgNotify, notifyPayload)
 		}
 		return nil
 	case MsgReadRequest:
@@ -74,9 +80,9 @@ func (b *Bridge) dispatch(t MsgType, payload []byte, out io.Writer, logSink io.W
 		}
 		reqID := payload[16:20]
 		respPayload := append([]byte{}, reqID...)
-		return WriteFrame(out, MsgReadResponse, respPayload)
+		return out.WriteFrame(MsgReadResponse, respPayload)
 	case MsgDebugGetLastCommand:
-		return WriteFrame(out, MsgDebugLastCommand, nil)
+		return out.WriteFrame(MsgDebugLastCommand, nil)
 	default:
 		return fmt.Errorf("unknown message type: 0x%02x", byte(t))
 	}

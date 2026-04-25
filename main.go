@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"sync"
 
@@ -15,19 +14,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// safeWriter serializes WriteFrame calls so the dispatch loop and the
-// async drain goroutine don't interleave bytes on stdout.
-type safeWriter struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func (s *safeWriter) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.Write(p)
-}
-
 // podAdapter glues bridge.Pod to pkg/pod by holding a *BridgeBle (which
 // is the BleInterface the pod state machine talks to) and a *pod.Pod
 // (whose StartAcceptingCommands runs in a goroutine, reading from the
@@ -35,14 +21,12 @@ func (s *safeWriter) Write(p []byte) (int, error) {
 type podAdapter struct {
 	p         *pod.Pod
 	bridgeBle *bridge.BridgeBle
-	out       *safeWriter
+	out       *bridge.FrameWriter
 	startOnce sync.Once
-	drainStop chan struct{}
 }
 
 func (a *podAdapter) OnConnect() error {
 	a.startOnce.Do(func() {
-		a.drainStop = make(chan struct{})
 		// Drain BleCore's outbound CMD packets -> NOTIFY frames.
 		go a.drain(bridge.CmdCharUUID, a.bridgeBle.PullCmd)
 		// Drain BleCore's outbound DATA packets -> NOTIFY frames.
@@ -72,9 +56,9 @@ func (a *podAdapter) OnWrite(charUUID [16]byte, data []byte) ([]byte, error) {
 	if !a.bridgeBle.RouteIncoming(charUUID, data) {
 		return nil, fmt.Errorf("unknown characteristic UUID: %x", charUUID)
 	}
-	// Outbound NOTIFYs are emitted asynchronously by the drain goroutines —
-	// they call WriteFrame on a.out (which is mutex-protected). Nothing
-	// synchronous to return here.
+	// Outbound NOTIFYs are emitted asynchronously by the drain goroutines
+	// directly via a.out (the FrameWriter, which serializes frame-atomic
+	// writes across all producers). Nothing synchronous to return here.
 	return nil, nil
 }
 
@@ -85,7 +69,7 @@ func (a *podAdapter) drain(charUUID [16]byte, pull func() bluetooth.Packet) {
 		notifyPayload := make([]byte, 16+len(pkt))
 		copy(notifyPayload[:16], charUUID[:])
 		copy(notifyPayload[16:], pkt)
-		if err := bridge.WriteFrame(a.out, bridge.MsgNotify, notifyPayload); err != nil {
+		if err := a.out.WriteFrame(bridge.MsgNotify, notifyPayload); err != nil {
 			log.Errorf("WriteFrame NOTIFY: %v", err)
 			return
 		}
@@ -113,19 +97,20 @@ func main() {
 	if *noAutoDisconnect {
 		// The original Pi sim's only auto-disconnect was the 1-minute
 		// ReadMessageWithTimeout in pkg/pod/CommandLoop which triggers a
-		// reconnect cycle. The bridge transport doesn't auto-disconnect
-		// on its own (the Swift side controls connect/disconnect via
-		// CONNECT/DISCONNECT frames), so this flag is currently a no-op
-		// on the bridge transport. Logged so test harnesses know it was
-		// acknowledged.
-		log.Info("auto-disconnect: no-op on bridge transport (controlled by Swift CONNECT/DISCONNECT frames)")
+		// reconnect cycle. On the bridge transport this is now safe
+		// (BridgeBle.ShutdownConnection stops the message loop so the
+		// restart works), but the Swift side still controls when to
+		// actually disconnect via CONNECT/DISCONNECT frames. The flag
+		// is logged here so test harnesses know it was acknowledged;
+		// it is currently informational.
+		log.Info("auto-disconnect: bridge transport restarts cleanly on idle (controlled by Swift CONNECT/DISCONNECT frames)")
 	}
 
 	bridgeBle := bridge.NewBridgeBle()
 
 	p := pod.New(bridgeBle, *stateFile, *freshState)
 
-	out := &safeWriter{w: os.Stdout}
+	out := bridge.NewFrameWriter(os.Stdout)
 	adapter := &podAdapter{p: p, bridgeBle: bridgeBle, out: out}
 	br := bridge.New(adapter)
 
