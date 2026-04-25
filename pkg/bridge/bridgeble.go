@@ -54,9 +54,22 @@ func (b *BridgeBle) RouteIncoming(charUUID [16]byte, data []byte) bool {
 	}
 }
 
-// ShutdownConnection is a no-op for the bridge — the central decides when
-// to disconnect; the bridge dispatch loop handles DISCONNECT frames.
-func (b *BridgeBle) ShutdownConnection() {}
+// ShutdownConnection stops BleCore's message loop so the pod state
+// machine's restart path in CommandLoop (after a 1-minute idle
+// ReadMessageWithTimeout) can call StartMessageLoop again without
+// tripping core.go's "Messaging loop is already running" log.Fatalf.
+//
+// We do NOT actually tear down the bridge transport here — the Swift
+// side controls connect/disconnect via CONNECT/DISCONNECT frames. We
+// just stop the message loop; the next StartAcceptingCommands call
+// will spin a fresh one.
+//
+// (Code review C2: previously a no-op, which caused log.Fatalf on the
+// subsequent StartMessageLoop after any 60-second idle period in iOS
+// test harnesses.)
+func (b *BridgeBle) ShutdownConnection() {
+	b.StopMessageLoop()
+}
 
 // RefreshAdvertisingWithSpecifiedId is a no-op for the bridge — advertising
 // is handled at the CBM layer in Swift.
