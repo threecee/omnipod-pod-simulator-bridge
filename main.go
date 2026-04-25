@@ -2,23 +2,102 @@ package main
 
 import (
 	"flag"
-	"time"
+	"fmt"
+	"io"
+	"os"
+	"sync"
 
-	"github.com/avereha/pod/pkg/api"
 	"github.com/avereha/pod/pkg/bluetooth"
+	"github.com/avereha/pod/pkg/bridge"
 	"github.com/avereha/pod/pkg/pod"
 
 	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 )
 
-func main() {
-	var stateFile = flag.String("state", "state.toml", "pod state")
-	var freshState = flag.Bool("fresh", false, "start fresh. not activated, empty state")
-	// if both verbose and quiet are chosen, e.g., -v -q, the verbose dominates
-	var traceLevel = flag.Bool("v", false, "verbose off by default, TraceLevel")
-	var infoLevel = flag.Bool("q", false, "quiet off by default, InfoLevel")
+// safeWriter serializes WriteFrame calls so the dispatch loop and the
+// async drain goroutine don't interleave bytes on stdout.
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
 
+func (s *safeWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// podAdapter glues bridge.Pod to pkg/pod by holding a *BridgeBle (which
+// is the BleInterface the pod state machine talks to) and a *pod.Pod
+// (whose StartAcceptingCommands runs in a goroutine, reading from the
+// BridgeBle channels).
+type podAdapter struct {
+	p         *pod.Pod
+	bridgeBle *bridge.BridgeBle
+	out       *safeWriter
+	startOnce sync.Once
+	drainStop chan struct{}
+}
+
+func (a *podAdapter) OnConnect() error {
+	a.startOnce.Do(func() {
+		a.drainStop = make(chan struct{})
+		// Drain BleCore's outbound CMD packets -> NOTIFY frames.
+		go a.drain(bridge.CmdCharUUID, a.bridgeBle.PullCmd)
+		// Drain BleCore's outbound DATA packets -> NOTIFY frames.
+		go a.drain(bridge.DataCharUUID, a.bridgeBle.PullData)
+		// Spin up the pod state machine. It blocks on bridgeBle channels.
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("pod state machine panicked: %v", r)
+				}
+			}()
+			a.p.StartAcceptingCommands()
+		}()
+	})
+	return nil
+}
+
+func (a *podAdapter) OnDisconnect() error {
+	// We don't tear down the pod state machine here — it's stateful and
+	// the central may reconnect. The production *Ble had similar
+	// semantics (StopMessageLoop was commented out on connect in the
+	// original code).
+	return nil
+}
+
+func (a *podAdapter) OnWrite(charUUID [16]byte, data []byte) ([]byte, error) {
+	if !a.bridgeBle.RouteIncoming(charUUID, data) {
+		return nil, fmt.Errorf("unknown characteristic UUID: %x", charUUID)
+	}
+	// Outbound NOTIFYs are emitted asynchronously by the drain goroutines —
+	// they call WriteFrame on a.out (which is mutex-protected). Nothing
+	// synchronous to return here.
+	return nil, nil
+}
+
+// drain pulls outbound packets and emits them as NOTIFY frames forever.
+func (a *podAdapter) drain(charUUID [16]byte, pull func() bluetooth.Packet) {
+	for {
+		pkt := pull()
+		notifyPayload := make([]byte, 16+len(pkt))
+		copy(notifyPayload[:16], charUUID[:])
+		copy(notifyPayload[16:], pkt)
+		if err := bridge.WriteFrame(a.out, bridge.MsgNotify, notifyPayload); err != nil {
+			log.Errorf("WriteFrame NOTIFY: %v", err)
+			return
+		}
+	}
+}
+
+func main() {
+	var stateFile = flag.String("state", "state.toml", "pod state file path")
+	var freshState = flag.Bool("fresh", false, "start fresh (unactivated pod, empty state)")
+	var noAutoDisconnect = flag.Bool("no-auto-disconnect", false, "disable Pi sim's auto-disconnect mimic (default off in tests)")
+	var traceLevel = flag.Bool("v", false, "verbose logging (TraceLevel)")
+	var infoLevel = flag.Bool("q", false, "quiet logging (InfoLevel only)")
 	flag.Parse()
 
 	if *traceLevel {
@@ -28,40 +107,32 @@ func main() {
 	} else {
 		log.SetLevel(log.DebugLevel)
 	}
+	log.SetFormatter(&logrus.TextFormatter{DisableQuote: true, ForceColors: false})
+	log.SetOutput(os.Stderr)
 
-	log.SetFormatter(&logrus.TextFormatter{
-		DisableQuote: true,
-		ForceColors:  true,
-	})
-
-	// TODO: This is kinda ugly, move state reader into own file and pass state to both BLE and pod
-	state := &pod.PODState{
-		Filename: *stateFile,
-	}
-	var err error
-	if !(*freshState) {
-		state, err = pod.NewState(*stateFile)
-		if err != nil {
-			log.Fatalf("pkg pod; could not restore pod state from %s: %+v", stateFile, err)
-		}
+	if *noAutoDisconnect {
+		// The original Pi sim's only auto-disconnect was the 1-minute
+		// ReadMessageWithTimeout in pkg/pod/CommandLoop which triggers a
+		// reconnect cycle. The bridge transport doesn't auto-disconnect
+		// on its own (the Swift side controls connect/disconnect via
+		// CONNECT/DISCONNECT frames), so this flag is currently a no-op
+		// on the bridge transport. Logged so test harnesses know it was
+		// acknowledged.
+		log.Info("auto-disconnect: no-op on bridge transport (controlled by Swift CONNECT/DISCONNECT frames)")
 	}
 
-	log.Tracef("podId %@ %x", state.Id, state.Id)
+	bridgeBle := bridge.NewBridgeBle()
 
-	ble, err := bluetooth.New("hci0", state.Id)
-	//defer ble.Close()
-	if err != nil {
-		log.Fatalf("Could not start BLE: %s", err)
+	p := pod.New(bridgeBle, *stateFile, *freshState)
+
+	out := &safeWriter{w: os.Stdout}
+	adapter := &podAdapter{p: p, bridgeBle: bridgeBle, out: out}
+	br := bridge.New(adapter)
+
+	log.Info("pod-sim starting; reading frames from stdin")
+	if err := br.Run(os.Stdin, out, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "bridge run error: %v\n", err)
+		os.Exit(1)
 	}
-
-	p := pod.New(ble, *stateFile, *freshState)
-	go func() {
-		p.StartAcceptingCommands()
-	}()
-
-	log.Info("Starting API")
-	s := api.New(p)
-	s.Start()
-
-	time.Sleep(9999 * time.Second)
+	log.Info("pod-sim exiting cleanly (stdin EOF)")
 }
