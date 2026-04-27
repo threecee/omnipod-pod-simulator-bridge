@@ -18,6 +18,21 @@ import (
 // is the BleInterface the pod state machine talks to) and a *pod.Pod
 // (whose StartAcceptingCommands runs in a goroutine, reading from the
 // BridgeBle channels).
+//
+// # Reconnect semantics
+//
+// startOnce ensures the pod state machine (StartAcceptingCommands) and the
+// drain goroutines are spun up exactly once per process lifetime, even if
+// the central disconnects and reconnects multiple times. On the first
+// OnConnect call the machine starts; on subsequent calls OnConnect is a
+// no-op that immediately returns nil (and the ConnectAck is still sent by
+// bridge.dispatch — so the central sees a successful reconnect).
+//
+// Pod state is therefore preserved across central reconnects. This matches
+// the production Pi's behaviour: the BLE peripheral stays up while the iOS
+// app reconnects, and the pod does not re-pair or reset. Tests that simulate
+// a disconnect-then-reconnect cycle should not expect a fresh pod state on
+// the second connect.
 type podAdapter struct {
 	p         *pod.Pod
 	bridgeBle *bridge.BridgeBle
@@ -28,9 +43,10 @@ type podAdapter struct {
 func (a *podAdapter) OnConnect() error {
 	a.startOnce.Do(func() {
 		// Drain BleCore's outbound CMD packets -> NOTIFY frames.
-		go a.drain(bridge.CmdCharUUID, a.bridgeBle.PullCmd)
+		// PullCmdStopped unblocks when bridgeBle.Stop() is called (on stdin EOF).
+		go a.drain(bridge.CmdCharUUID, a.bridgeBle.PullCmdStopped)
 		// Drain BleCore's outbound DATA packets -> NOTIFY frames.
-		go a.drain(bridge.DataCharUUID, a.bridgeBle.PullData)
+		go a.drain(bridge.DataCharUUID, a.bridgeBle.PullDataStopped)
 		// Spin up the pod state machine. It blocks on bridgeBle channels.
 		go func() {
 			defer func() {
@@ -72,10 +88,19 @@ func (a *podAdapter) OnWrite(charUUID [16]byte, data []byte) ([]byte, error) {
 	return nil, nil
 }
 
-// drain pulls outbound packets and emits them as NOTIFY frames forever.
-func (a *podAdapter) drain(charUUID [16]byte, pull func() bluetooth.Packet) {
+// drain pulls outbound packets and emits them as NOTIFY frames.
+//
+// It exits when BridgeBle.Done() is closed (i.e., when Stop() is called
+// after Bridge.Run returns on stdin EOF) or when WriteFrame returns an error
+// (e.g., stdout pipe closed). Without this Done() select, PullCmd/PullData
+// block forever on their respective channels after the protocol loop has
+// exited, leaking the goroutine until process exit.
+func (a *podAdapter) drain(charUUID [16]byte, pull func() (bluetooth.Packet, bool)) {
 	for {
-		pkt := pull()
+		pkt, ok := pull()
+		if !ok {
+			return
+		}
 		notifyPayload := make([]byte, 16+len(pkt))
 		copy(notifyPayload[:16], charUUID[:])
 		copy(notifyPayload[16:], pkt)
@@ -127,7 +152,13 @@ func main() {
 	log.Info("pod-sim starting; reading frames from stdin")
 	if err := br.Run(os.Stdin, out, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "bridge run error: %v\n", err)
+		bridgeBle.Stop() // unblock drain goroutines before exiting
 		os.Exit(1)
 	}
+	// Stop the BridgeBle so the CMD and DATA drain goroutines unblock and
+	// return cleanly. Without this, they block forever on PullCmd/PullData
+	// (which select on the cmdOutput/dataOutput channels) and leak until the
+	// process exits. With Stop(), they observe the done channel and return.
+	bridgeBle.Stop()
 	log.Info("pod-sim exiting cleanly (stdin EOF)")
 }

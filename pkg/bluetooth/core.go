@@ -94,6 +94,12 @@ func (b *BleCore) PushData(p Packet) { b.dataInput <- p }
 func (b *BleCore) PullCmd() Packet  { return <-b.cmdOutput }
 func (b *BleCore) PullData() Packet { return <-b.dataOutput }
 
+// CmdOutputCh / DataOutputCh expose the underlying outgoing packet channels
+// so callers can multiplex them in a select alongside a stop/done channel.
+// These are intentionally read-only; the channels are owned by BleCore.
+func (b *BleCore) CmdOutputCh() <-chan Packet  { return b.cmdOutput }
+func (b *BleCore) DataOutputCh() <-chan Packet { return b.dataOutput }
+
 // PullCmdWithTimeout / PullDataWithTimeout — non-blocking variants for
 // transports that want to multiplex in a single goroutine (e.g., the stdio
 // bridge's drain loop).
